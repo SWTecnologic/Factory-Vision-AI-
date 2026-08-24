@@ -1,0 +1,27 @@
+# ============================================================
+# DEPENDÊNCIAS PRINCIPAIS
+# ============================================================
+
+# OpenCV - Processamento de imagem
+# Use opencv-python-headless para servidores (sem GUI)
+opencv-python==4.9.0.80
+# opencv-python-headless==4.9.0.80  # Alternativa para servidor
+
+# YOLO - Detecção de objetos e pose
+ultralytics==8.1.24
+
+# Utilitários
+numpy==1.26.4
+requests==2.31.0
+python-dotenv==1.0.1
+
+# ============================================================
+# DEPENDÊNCIAS OPCIONAIS
+# ============================================================
+
+# Supabase (opcional - apenas se for usar o banco)
+# supabase==2.3.4
+
+# Para visualização de dados (opcional)
+# matplotlib==3.8.3
+# pandas==2.2.1

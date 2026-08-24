@@ -1,0 +1,2 @@
+{"event_id": "67f53e2b-1e9e-499b-ba6b-b0398ada1f87", "camera_id": "posto-costura-01", "operator_id": "operador-001", "event_type": "camera_started", "severity": "info", "occurred_at": "2026-08-24T16:11:49.394767+00:00", "payload": {"video_source": "video_teste.mp4", "device": "cpu"}}
+{"event_id": "a48a5161-e9db-4913-93e8-3295f78706a3", "camera_id": "posto-costura-01", "operator_id": "operador-001", "event_type": "camera_stopped", "severity": "info", "occurred_at": "2026-08-24T16:12:17.781286+00:00", "payload": {"processed_frames": 124, "completed_cycles": 0}}
