@@ -10,21 +10,28 @@ confidence, bbox) a partir de visao computacional 100% local:
     - Deteccao de LUVA -> segmentacao de cor (HSV) + tracking por centroide
                           + heuristica geometrica (aspect ratio / area) para
                           diferenciar "luva_aberta" de "luva_dobrada"
-    - Deteccao de CAIXA -> nao e' detectada por classificador; e' uma ROI
-                          (regiao) configuravel do frame. A classe "caixa"
-                          so e' emitida quando uma luva JA CONFIRMADA COMO
-                          DOBRADA tem seu centroide dentro dessa ROI. Isso
-                          reproduz fielmente o evento #7 do pedido:
-                          "detectar quando a luva dobrada e' colocada
-                          dentro da caixa" (e nao apenas "caixa esta
-                          visivel", que e' sempre verdade numa camera fixa).
+    - ZONAS (caixas)   -> NAO sao detectadas por classificador; sao
+                          regioes (ROIs) configuraveis, desenhadas
+                          visualmente no frontend (StationZonesPage) e
+                          salvas na tabela "zones" do Supabase. Cada
+                          zona tem um zone_type (ex.: PACKAGING_BOX,
+                          DISCARD_BOX) e so' emite deteccao quando uma
+                          luva JA CONFIRMADA COMO DOBRADA tem seu
+                          centroide dentro dela. Isso reproduz
+                          fielmente o evento "detectar quando a luva
+                          dobrada e' colocada dentro da caixa
+                          [de embalagem/descarte]" (e nao apenas
+                          "caixa esta visivel", que e' sempre
+                          verdade numa camera fixa).
 
 Este modulo foi desenhado para ser um DROP-IN replacement de
 `run_workflow_api()`: a funcao `detect_local(frame)` devolve
 `List[Detection]` com os MESMOS nomes de classe que o main.py ja
-espera (HAND_CLASSES / GLOVE_CLASSES / BAG_CLASSES), entao o
-CycleManager, EventWriter, ProductionRepository e Supabase NAO
-precisam mudar.
+espera (HAND_CLASSES / GLOVE_CLASSES / PACKAGING_CLASSES /
+DISCARD_CLASSES), entao o CycleManager, EventWriter,
+ProductionRepository e Supabase NAO precisam mudar quando as zonas
+sao alteradas — so' o que muda e' QUAIS zonas existem, vindas do
+banco.
 
 Quando um modelo YOLO local (.pt) treinado especificamente para essa
 operacao estiver disponivel, basta substituir o corpo de
@@ -36,7 +43,7 @@ import os
 import time
 import urllib.request
 from dataclasses import dataclass, field
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -100,21 +107,76 @@ GLOVE_FOLDED_AREA_RATIO_MAX = float(
 )
 GLOVE_FOLD_CONFIRM_FRAMES = int(os.getenv("GLOVE_FOLD_CONFIRM_FRAMES", "3"))
 
-# --- ROI da caixa (fracoes 0..1 do frame: x1,y1,x2,y2) ---
-# Default calibrado no video enviado (caixa no lado direito do frame).
-# Ajuste para a posicao real da caixa na sua camera.
-_box_roi_raw = os.getenv("BOX_ROI", "0.62,0.10,1.0,1.0")
-BOX_ROI_FRAC = tuple(float(v) for v in _box_roi_raw.split(","))
-
 # --- Tracking simples por centroide (para nao contar a mesma luva 2x) ---
 TRACK_MAX_DISTANCE_PX = int(os.getenv("TRACK_MAX_DISTANCE_PX", "120"))
 TRACK_MAX_MISSED_FRAMES = int(os.getenv("TRACK_MAX_MISSED_FRAMES", "10"))
 
-# --- Margem extra ao redor da ROI da caixa para considerar que a MAO
-# ainda esta "na caixa" (segurando/soltando a luva). Sem essa margem,
-# a mao sairia da deteccao um pouco antes do previsto porque a ROI da
-# caixa e' desenhada nas bordas internas do papelao.
+# --- Margem extra ao redor de cada zona de caixa para considerar que
+# a MAO ainda esta "na caixa" (segurando/soltando a luva). Sem essa
+# margem, a mao sairia da deteccao um pouco antes do previsto porque
+# a ROI da caixa e' desenhada nas bordas internas do papelao.
 HAND_BOX_MARGIN_PX = int(os.getenv("HAND_BOX_MARGIN_PX", "40"))
+
+
+# ============================================================
+# ZONAS DINAMICAS (vindas do Supabase, configuradas no frontend)
+# ============================================================
+# Cada zona: {"id":..., "name":..., "zone_type":..., "frac": (x1,y1,x2,y2)}
+# "frac" esta em 0..1, independente da resolucao real do frame — o
+# frontend salva coordinates em PORCENTAGEM (0..100) e o main.py
+# converte para fracao (0..1) antes de chamar configure_zones().
+
+_ZONES: List[dict] = []
+
+# Fallback: se nenhuma zona vier do Supabase (ex.: banco offline, ou
+# estacao ainda sem nenhuma zona cadastrada), usa o BOX_ROI do .env
+# como uma unica zona do tipo PACKAGING_BOX, pra nao quebrar
+# setups antigos/testes locais sem banco.
+_fallback_roi_raw = os.getenv("BOX_ROI", "0.62,0.10,1.0,1.0")
+_FALLBACK_ZONE = {
+    "id": None,
+    "name": "fallback_env (BOX_ROI)",
+    "zone_type": "PACKAGING_BOX",
+    "frac": tuple(float(v) for v in _fallback_roi_raw.split(",")),
+}
+
+# Mapeia o zone_type (igual ao que o frontend salva na coluna
+# "zone_type" da tabela "zones") para a classe de deteccao que o
+# CycleManager (main.py) reconhece via PACKAGING_CLASSES /
+# DISCARD_CLASSES. Zonas com zone_type nao mapeado aqui (ex.:
+# INSPECTION, DANGER, STORAGE, ASSEMBLY) sao ignoradas pela logica
+# de ciclo, mas continuam sendo desenhadas no streaming.
+ZONE_TYPE_CLASS_MAP: Dict[str, str] = {
+    "PACKAGING_BOX": "caixa_embalagem",
+    "DISCARD_BOX": "caixa_descarte",
+}
+
+
+def configure_zones(zones: List[dict]):
+    """Chamado pelo main.py (na inicializacao e, opcionalmente, num
+    refresh periodico) depois de buscar as zonas no Supabase.
+    Substitui completamente o conjunto de zonas ativas."""
+
+    global _ZONES
+    _ZONES = zones
+
+
+def _active_zones() -> List[dict]:
+    """Zonas configuradas via Supabase, ou o fallback do .env se
+    nao houver nenhuma."""
+
+    return _ZONES if _ZONES else [_FALLBACK_ZONE]
+
+
+def _zone_pixels(zone: dict, frame_shape) -> Tuple[int, int, int, int]:
+    h_frame, w_frame = frame_shape[:2]
+    x1, y1, x2, y2 = zone["frac"]
+    return (
+        int(x1 * w_frame),
+        int(y1 * h_frame),
+        int(x2 * w_frame),
+        int(y2 * h_frame),
+    )
 
 
 # ============================================================
@@ -154,7 +216,7 @@ class HandDetector:
         if not os.path.exists(HAND_MODEL_PATH):
             print(
                 "Deteccao de MAO desativada (sem modelo local). "
-                "O motor vai funcionar apenas com deteccao de luva/caixa."
+                "O motor vai funcionar apenas com deteccao de luva/zonas."
             )
             return
 
@@ -321,7 +383,8 @@ class GloveTracker:
 
 
 # ============================================================
-# GLOVE DETECTOR (segmentacao HSV + tracking + heuristica de dobra)
+# GLOVE DETECTOR (segmentacao HSV + tracking + heuristica de dobra
+# + verificacao contra as ZONAS dinamicas do Supabase)
 # ============================================================
 
 class GloveDetector:
@@ -329,8 +392,8 @@ class GloveDetector:
 
     Substituivel no futuro por um YOLO treinado: basta trocar o corpo
     de `_segment()` por inferencia do modelo e manter o resto (o
-    tracking + heuristica de dobra continuam validos mesmo com boxes
-    vindas de um YOLO real).
+    tracking + heuristica de dobra + verificacao de zonas continuam
+    validos mesmo com boxes vindas de um YOLO real).
     """
 
     def __init__(self):
@@ -361,15 +424,15 @@ class GloveDetector:
         return boxes
 
     def detect(self, frame_bgr) -> List[Detection]:
-        h_frame, w_frame = frame_bgr.shape[:2]
-
-        box_x1 = int(BOX_ROI_FRAC[0] * w_frame)
-        box_y1 = int(BOX_ROI_FRAC[1] * h_frame)
-        box_x2 = int(BOX_ROI_FRAC[2] * w_frame)
-        box_y2 = int(BOX_ROI_FRAC[3] * h_frame)
-
         raw_boxes = self._segment(frame_bgr)
         tracked = self.tracker.update(raw_boxes)
+
+        # Zonas ativas neste frame, ja convertidas para pixels (uma
+        # unica vez por frame, nao por track).
+        zone_pixels = [
+            (_zone_pixels(z, frame_bgr.shape), z["zone_type"])
+            for z in _active_zones()
+        ]
 
         detections = []
 
@@ -416,32 +479,43 @@ class GloveDetector:
                 )
             )
 
-            # Evento-chave #7: luva JA CONFIRMADA COMO DOBRADA cujo
-            # centroide esta dentro da ROI da caixa -> emite "caixa".
+            # Evento-chave: luva JA CONFIRMADA COMO DOBRADA cujo
+            # centroide cai dentro de ALGUMA zona configurada no
+            # Supabase -> emite a classe correspondente ao
+            # zone_type daquela zona especifica (embalagem,
+            # descarte, ...). Uma luva so' pode estar em uma zona
+            # por vez, entao paramos no primeiro match.
             if track.folded_confirmed:
                 cx, cy = track.center
-                inside_box = (
-                    box_x1 <= cx <= box_x2 and box_y1 <= cy <= box_y2
-                )
-                if inside_box:
-                    detections.append(
-                        Detection(
-                            class_name="caixa",
-                            confidence=0.9,
-                            bbox=track.bbox,
-                        )
-                    )
+
+                for (bx1, by1, bx2, by2), zone_type in zone_pixels:
+
+                    if bx1 <= cx <= bx2 and by1 <= cy <= by2:
+
+                        mapped_class = ZONE_TYPE_CLASS_MAP.get(zone_type)
+
+                        if mapped_class:
+                            detections.append(
+                                Detection(
+                                    class_name=mapped_class,
+                                    confidence=0.9,
+                                    bbox=track.bbox,
+                                )
+                            )
+
+                        break
 
         return detections
 
-    def box_roi_pixels(self, frame_shape) -> Tuple[int, int, int, int]:
-        h_frame, w_frame = frame_shape[:2]
-        return (
-            int(BOX_ROI_FRAC[0] * w_frame),
-            int(BOX_ROI_FRAC[1] * h_frame),
-            int(BOX_ROI_FRAC[2] * w_frame),
-            int(BOX_ROI_FRAC[3] * h_frame),
-        )
+    def zones_pixels(self, frame_shape):
+        """Todas as zonas ativas em pixels, com nome e tipo — usado
+        para desenhar no streaming (debug visual) e para o
+        detect_local() verificar a mao contra todas as caixas."""
+
+        return [
+            (_zone_pixels(z, frame_shape), z["zone_type"], z["name"])
+            for z in _active_zones()
+        ]
 
 
 # ============================================================
@@ -462,14 +536,14 @@ def _get_detectors():
 
 
 def detect_local(frame_bgr) -> List[Detection]:
-    """Roda a deteccao 100% local (mao + luva + caixa) em um frame.
+    """Roda a deteccao 100% local (mao + luva + zonas) em um frame.
 
     Retorna List[Detection] com class_name em {"mao", "mao_na_caixa",
-    "luva_aberta", "luva_dobrada", "caixa"} — compativel com
-    HAND_CLASSES, GLOVE_CLASSES e BAG_CLASSES ja existentes no
-    main.py, mais a nova classe "mao_na_caixa" usada para confirmar
-    com precisao o momento em que o operador solta a luva e afasta
-    a mao da caixa (evento de producao real).
+    "luva_aberta", "luva_dobrada", "caixa_embalagem",
+    "caixa_descarte"} — compativel com HAND_CLASSES, GLOVE_CLASSES,
+    PACKAGING_CLASSES e DISCARD_CLASSES do main.py, cujas zonas
+    (posicao e tipo) vem dinamicamente do Supabase via
+    configure_zones().
     """
     hand_detector, glove_detector = _get_detectors()
 
@@ -480,38 +554,48 @@ def detect_local(frame_bgr) -> List[Detection]:
 
     # ------------------------------------------------------------
     # "mao_na_caixa": emitido quando o centro de QUALQUER mao
-    # detectada esta dentro da ROI da caixa (com uma margem extra).
-    # Isso e' o sinal usado pelo CycleManager para saber que o
-    # operador AINDA esta segurando/posicionando a luva dentro da
-    # caixa — so' quando esse sinal desaparecer por alguns frames
-    # consecutivos e' que a producao e' confirmada (mao se afastou).
+    # detectada esta dentro de QUALQUER zona de caixa configurada
+    # (com uma margem extra). Isso e' o sinal usado pelo
+    # CycleManager para saber que o operador AINDA esta
+    # segurando/posicionando a luva dentro da caixa — so' quando
+    # esse sinal desaparecer por alguns frames consecutivos e' que
+    # a producao/descarte e' confirmado (mao se afastou).
     # ------------------------------------------------------------
     if hand_detections:
-        h_frame, w_frame = frame_bgr.shape[:2]
-        bx1, by1, bx2, by2 = glove_detector.box_roi_pixels(
-            frame_bgr.shape
-        )
-        bx1 -= HAND_BOX_MARGIN_PX
-        by1 -= HAND_BOX_MARGIN_PX
-        bx2 += HAND_BOX_MARGIN_PX
-        by2 += HAND_BOX_MARGIN_PX
 
-        for hand_det in hand_detections:
-            hx, hy = hand_det.center
-            if bx1 <= hx <= bx2 and by1 <= hy <= by2:
-                detections.append(
-                    Detection(
-                        class_name="mao_na_caixa",
-                        confidence=hand_det.confidence,
-                        bbox=hand_det.bbox,
+        for (bx1, by1, bx2, by2), _zone_type, _name in (
+            glove_detector.zones_pixels(frame_bgr.shape)
+        ):
+
+            bx1 -= HAND_BOX_MARGIN_PX
+            by1 -= HAND_BOX_MARGIN_PX
+            bx2 += HAND_BOX_MARGIN_PX
+            by2 += HAND_BOX_MARGIN_PX
+
+            hand_in_this_zone = False
+
+            for hand_det in hand_detections:
+                hx, hy = hand_det.center
+                if bx1 <= hx <= bx2 and by1 <= hy <= by2:
+                    detections.append(
+                        Detection(
+                            class_name="mao_na_caixa",
+                            confidence=hand_det.confidence,
+                            bbox=hand_det.bbox,
+                        )
                     )
-                )
-                break  # uma ocorrencia ja basta como sinal
+                    hand_in_this_zone = True
+                    break  # uma ocorrencia ja basta como sinal
+
+            if hand_in_this_zone:
+                break  # nao precisa checar as outras zonas
 
     return detections
 
 
-def get_box_roi_pixels(frame_shape) -> Tuple[int, int, int, int]:
-    """Exposto para desenhar a ROI da caixa no streaming (debug visual)."""
+def get_zones_pixels(frame_shape):
+    """Exposto para o main.py desenhar TODAS as zonas configuradas
+    (embalagem, descarte, etc.) no streaming (debug visual)."""
+
     _, glove_detector = _get_detectors()
-    return glove_detector.box_roi_pixels(frame_shape)
+    return glove_detector.zones_pixels(frame_shape)

@@ -104,11 +104,13 @@ except Exception as e:
 # ============================================================
 # VISAO COMPUTACIONAL LOCAL (substitui o Roboflow por completo)
 # ============================================================
-# Toda a inferencia (mao / luva / caixa) agora roda localmente,
+# Toda a inferencia (mao / luva / zonas) agora roda localmente,
 # via local_vision.py (MediaPipe + OpenCV). Nenhuma chamada de
-# rede e' feita para detectar objetos.
+# rede e' feita para detectar objetos. As ZONAS (caixa de
+# embalagem, caixa de descarte, etc.) agora vem do Supabase,
+# configuradas visualmente no frontend (StationZonesPage).
 
-from local_vision import detect_local, get_box_roi_pixels
+from local_vision import detect_local, get_zones_pixels, configure_zones
 
 POSTURE_ENABLED = os.getenv(
     "POSTURE_ENABLED",
@@ -183,6 +185,16 @@ START_CONFIRMATIONS_REQUIRED = int(
     os.getenv(
         "START_CONFIRMATIONS_REQUIRED",
         "2"
+    )
+)
+
+# Intervalo (segundos) para o motor re-consultar as zonas no
+# Supabase, sem precisar reiniciar o processo. 0 = desativado
+# (zonas carregadas so' uma vez, na inicializacao).
+ZONES_REFRESH_SECONDS = int(
+    os.getenv(
+        "ZONES_REFRESH_SECONDS",
+        "60"
     )
 )
 
@@ -457,6 +469,130 @@ else:
     CAMERA_NAME = "camera-local"
 
 # ============================================================
+# ZONAS DA ESTACAO (caixa de embalagem, caixa de descarte, etc.)
+# ============================================================
+# As zonas sao desenhadas visualmente no frontend
+# (StationZonesPage) e salvas na tabela "zones" do Supabase, com
+# coordinates em PORCENTAGEM (0..100) do frame: {x, y, width,
+# height}. Aqui convertemos para fracao (0..1) e entregamos ao
+# local_vision.py, que faz todo o calculo de pixels sozinho -
+# assim funciona em qualquer resolucao de camera.
+
+class ZoneRepository:
+
+    def __init__(self, station_id):
+        self.station_id = station_id
+
+    def get_zones(self):
+
+        if not supabase:
+            return []
+
+        try:
+
+            result = (
+                supabase
+                .table("zones")
+                .select("*")
+                .eq(
+                    "station_id",
+                    self.station_id
+                )
+                .eq(
+                    "status",
+                    "ACTIVE"
+                )
+                .execute()
+            )
+
+            return result.data or []
+
+        except Exception as e:
+
+            print(
+                f"Erro ao buscar zonas: {e}"
+            )
+
+            return []
+
+
+def load_zones_for_local_vision(station_id):
+    """Busca as zonas no Supabase e converte pra formato
+    fracionario (0..1) que o local_vision.py usa pra calcular
+    pixels em qualquer resolucao de frame."""
+
+    zone_rows = ZoneRepository(station_id).get_zones()
+
+    zones = []
+
+    for row in zone_rows:
+
+        coords = row.get("coordinates") or {}
+
+        try:
+
+            x1 = float(coords["x"]) / 100.0
+            y1 = float(coords["y"]) / 100.0
+            x2 = x1 + float(coords["width"]) / 100.0
+            y2 = y1 + float(coords["height"]) / 100.0
+
+        except (KeyError, TypeError, ValueError):
+
+            print(
+                f"Zona '{row.get('name')}' com coordinates "
+                f"invalido, ignorando."
+            )
+
+            continue
+
+        zones.append(
+            {
+                "id":
+                    row.get("id"),
+
+                "name":
+                    row.get("name"),
+
+                "zone_type":
+                    row.get("zone_type"),
+
+                "frac":
+                    (x1, y1, x2, y2),
+            }
+        )
+
+    if zones:
+
+        print(
+            f"{len(zones)} zona(s) carregada(s) do Supabase:"
+        )
+
+        for z in zones:
+
+            print(
+                f"   - {z['name']} ({z['zone_type']})"
+            )
+
+    else:
+
+        print(
+            "Nenhuma zona configurada no Supabase para esta "
+            "estacao. Usando fallback do BOX_ROI do .env "
+            "(se existir)."
+        )
+
+    return zones
+
+
+zones = load_zones_for_local_vision(
+    station["id"]
+)
+
+configure_zones(
+    zones
+)
+
+# ============================================================
 # CLASSES DA IA
 # ============================================================
 
@@ -496,20 +632,26 @@ OPEN_GLOVE_CLASSES = {
     "luva_aberta"
 }
 
-BAG_CLASSES = {
-    "plastic_bag",
-    "plastic bag",
-    "bag",
-    "saco",
-    "saco_plastico",
-    "cardboard_box",
+# Zonas do tipo "caixa de embalagem" — producao normal, boa.
+# "caixa" e' mantido por compatibilidade com o fallback do
+# BOX_ROI (.env), que emite essa classe generica quando nao ha'
+# nenhuma zona configurada no Supabase.
+PACKAGING_CLASSES = {
+    "caixa_embalagem",
     "caixa"
 }
 
-# Mao detectada dentro/perto da ROI da caixa — sinal de que o
-# operador ainda esta segurando ou posicionando a luva dentro da
-# caixa. So' quando esse sinal SOME por alguns frames consecutivos e'
-# que a producao e' confirmada (mao se afastou = luva foi solta).
+# Zonas do tipo "caixa de descarte" — peca rejeitada, nao entra
+# na contagem de producao (vira evento "item_descartado").
+DISCARD_CLASSES = {
+    "caixa_descarte"
+}
+
+# Mao detectada dentro/perto da ROI de QUALQUER zona de caixa —
+# sinal de que o operador ainda esta segurando ou posicionando a
+# luva dentro da caixa. So' quando esse sinal SOME por alguns
+# frames consecutivos e' que a producao e' confirmada (mao se
+# afastou).
 HAND_IN_BOX_CLASSES = {
     "mao_na_caixa"
 }
@@ -784,34 +926,60 @@ class EventWriter:
         )
 
 # ============================================================
-# DESENHAR DETECCOES
+# DESENHAR DETECCOES / ZONAS
 # ============================================================
 
-def draw_box_roi(frame):
-    """Desenha a ROI (regiao) configurada da caixa, para calibracao
-    visual no streaming. Ajuste a variavel de ambiente BOX_ROI se a
-    caixa da sua estacao real ficar em outra posicao do frame."""
+def draw_zones(frame):
+    """Desenha TODAS as zonas configuradas (embalagem, descarte,
+    etc.), lidas do Supabase, para calibracao visual no
+    streaming. Cores diferentes por zone_type."""
 
-    x1, y1, x2, y2 = get_box_roi_pixels(frame.shape)
+    for (x1, y1, x2, y2), zone_type, name in get_zones_pixels(
+        frame.shape
+    ):
 
-    cv2.rectangle(
-        frame,
-        (x1, y1),
-        (x2, y2),
-        (0, 165, 255),
-        2
-    )
+        if zone_type == "DISCARD_BOX":
 
-    cv2.putText(
-        frame,
-        "ROI caixa",
-        (x1 + 4, y1 + 20),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.5,
-        (0, 165, 255),
-        2,
-        cv2.LINE_AA
-    )
+            color = (
+                0,
+                0,
+                255
+            )
+
+        elif zone_type == "PACKAGING_BOX":
+
+            color = (
+                0,
+                165,
+                255
+            )
+
+        else:
+
+            color = (
+                255,
+                255,
+                0
+            )
+
+        cv2.rectangle(
+            frame,
+            (x1, y1),
+            (x2, y2),
+            color,
+            2
+        )
+
+        cv2.putText(
+            frame,
+            name or zone_type,
+            (x1 + 4, y1 + 20),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.5,
+            color,
+            2,
+            cv2.LINE_AA
+        )
 
 
 def draw_detections(
@@ -841,10 +1009,18 @@ def draw_detections(
                 255
             )
 
-        elif detection.class_name in BAG_CLASSES:
+        elif detection.class_name in PACKAGING_CLASSES:
 
             color = (
                 255,
+                0,
+                255
+            )
+
+        elif detection.class_name in DISCARD_CLASSES:
+
+            color = (
+                0,
                 0,
                 255
             )
@@ -1195,6 +1371,8 @@ class CycleManager:
 
         self.total_gloves = 0
 
+        self.total_discarded = 0
+
         self.production_start_monotonic = None
 
         self.current_production_id = None
@@ -1210,6 +1388,12 @@ class CycleManager:
         self.start_confirmations = 0
 
         self.last_stage_change = 0
+
+        # "OK" = vai para caixa de embalagem (producao valida).
+        # "DESCARTE" = vai para caixa de descarte (peca rejeitada).
+        # Decidido na transicao ETAPA 1 -> 2, conforme QUAL zona
+        # recebeu a luva dobrada, e consumido na ETAPA 2 -> ciclo.
+        self.pending_outcome = "OK"
 
         self._load_steps()
 
@@ -1443,7 +1627,10 @@ class CycleManager:
                         self.cycle_number,
 
                     "total_produced":
-                        self.total_gloves
+                        self.total_gloves,
+
+                    "total_discarded":
+                        self.total_discarded
                 },
                 current_production_id=
                     production_id
@@ -1473,9 +1660,14 @@ class CycleManager:
             OPEN_GLOVE_CLASSES
         )
 
-        boxes = get_detections_by_classes(
+        packaging_hits = get_detections_by_classes(
             detections,
-            BAG_CLASSES
+            PACKAGING_CLASSES
+        )
+
+        discard_hits = get_detections_by_classes(
+            detections,
+            DISCARD_CLASSES
         )
 
         hand_in_box = get_detections_by_classes(
@@ -1487,19 +1679,21 @@ class CycleManager:
 
         has_open_glove = len(open_gloves) > 0
 
-        # "luva DOBRADA confirmada DENTRO da ROI da caixa" — emitido
-        # pelo local_vision.py somente apos a luva ja ter passado
-        # por luva_aberta -> luva_dobrada e o centro dela estar
-        # dentro da regiao da caixa. Ou seja, "has_box" aqui ja
-        # significa "luva dobrada entrou na caixa" (evento #6 do
-        # fluxo pedido), nao apenas "existe uma caixa visivel".
-        has_folded_glove_in_box = len(boxes) > 0
+        # "luva DOBRADA confirmada DENTRO de uma zona de caixa" —
+        # emitido pelo local_vision.py somente apos a luva ja ter
+        # passado por luva_aberta -> luva_dobrada e o centro dela
+        # estar dentro de UMA das zonas configuradas no Supabase.
+        # Cada tipo de zona (embalagem / descarte) gera uma classe
+        # diferente, tratada separadamente aqui.
+        has_folded_glove_in_packaging = len(packaging_hits) > 0
 
-        # "a mao ainda esta dentro/perto da caixa" — sinal de que o
-        # operador esta segurando/posicionando a luva, ainda NAO
-        # soltou. So' quando esse sinal sumir por N frames seguidos
-        # e' que consideramos a luva efetivamente solta e a mao
-        # afastada (evento #7-#9 do fluxo pedido).
+        has_folded_glove_in_discard = len(discard_hits) > 0
+
+        # "a mao ainda esta dentro/perto de alguma caixa" — sinal
+        # de que o operador esta segurando/posicionando a luva,
+        # ainda NAO soltou. So' quando esse sinal sumir por N
+        # frames seguidos e' que consideramos a luva efetivamente
+        # solta e a mao afastada.
         has_hand_in_box = len(hand_in_box) > 0
 
         # Usado apenas para permitir o INICIO de um novo ciclo
@@ -1562,14 +1756,23 @@ class CycleManager:
                 )
 
         # ==========================================================
-        # ETAPA 1 -> 2: a luva DOBRADA entrou na regiao da caixa.
-        # (has_folded_glove_in_box so' fica True apos a luva ja
-        # confirmada como dobrada — ver local_vision.py)
+        # ETAPA 1 -> 2: a luva DOBRADA entrou em alguma zona de
+        # caixa (embalagem OU descarte). Guardamos qual foi, para
+        # decidir o desfecho do ciclo mais adiante.
         # ==========================================================
 
         elif self.current_stage == 1:
 
-            if has_folded_glove_in_box:
+            if (
+                has_folded_glove_in_packaging
+                or has_folded_glove_in_discard
+            ):
+
+                self.pending_outcome = (
+                    "DESCARTE"
+                    if has_folded_glove_in_discard
+                    else "OK"
+                )
 
                 self._complete_step(
                     1
@@ -1588,10 +1791,16 @@ class CycleManager:
                     current_time
                 )
 
+                destino = (
+                    "caixa de DESCARTE"
+                    if self.pending_outcome == "DESCARTE"
+                    else "caixa de EMBALAGEM"
+                )
+
                 print(
-                    "[ETAPA 2] "
-                    "Luva dobrada entrou na caixa. "
-                    "Aguardando operador soltar e afastar a mao."
+                    f"[ETAPA 2] Luva dobrada entrou na "
+                    f"{destino}. Aguardando operador soltar "
+                    f"e afastar a mao."
                 )
 
         # ==========================================================
@@ -1627,51 +1836,95 @@ class CycleManager:
 
                 self.cycle_number += 1
 
-                self.total_gloves += 1
+                if self.pending_outcome == "DESCARTE":
 
-                print(
-                    "1 LUVA PRODUZIDA "
-                    "(dobrada -> entregue na caixa -> mao afastada)"
-                )
+                    self.total_discarded += 1
 
-                print(
-                    f"Total produzido: "
-                    f"{self.total_gloves}"
-                )
+                    print(
+                        "1 PECA DESCARTADA "
+                        "(dobrada -> caixa de descarte -> "
+                        "mao afastada)"
+                    )
 
-                if self.event_writer:
+                    print(
+                        f"Total descartado: "
+                        f"{self.total_discarded}"
+                    )
 
-                    cycle_duration = None
+                    if self.event_writer:
 
-                    if self.production_start_monotonic is not None:
+                        self.event_writer.write(
+                            "item_descartado",
+                            {
+                                "cycle_number":
+                                    self.cycle_number,
 
-                        cycle_duration = round(
-                            time.monotonic()
-                            - self.production_start_monotonic,
-                            2
+                                "total_discarded":
+                                    self.total_discarded,
+
+                                "product_name":
+                                    self.product_name,
+
+                                "station_id":
+                                    self.station_id
+                            },
+                            current_production_id=
+                                self.current_production_id
                         )
 
-                    self.event_writer.write(
-                        "cycle_completed",
-                        {
-                            "cycle_number":
-                                self.cycle_number,
+                else:
 
-                            "total_produced":
-                                self.total_gloves,
+                    self.total_gloves += 1
 
-                            "product_name":
-                                self.product_name,
-
-                            "station_id":
-                                self.station_id,
-
-                            "cycle_duration_seconds":
-                                cycle_duration
-                        },
-                        current_production_id=
-                            self.current_production_id
+                    print(
+                        "1 LUVA PRODUZIDA "
+                        "(dobrada -> caixa de embalagem -> "
+                        "mao afastada)"
                     )
+
+                    print(
+                        f"Total produzido: "
+                        f"{self.total_gloves}"
+                    )
+
+                    if self.event_writer:
+
+                        cycle_duration = None
+
+                        if (
+                            self.production_start_monotonic
+                            is not None
+                        ):
+
+                            cycle_duration = round(
+                                time.monotonic()
+                                - self.production_start_monotonic,
+                                2
+                            )
+
+                        self.event_writer.write(
+                            "cycle_completed",
+                            {
+                                "cycle_number":
+                                    self.cycle_number,
+
+                                "total_produced":
+                                    self.total_gloves,
+
+                                "product_name":
+                                    self.product_name,
+
+                                "station_id":
+                                    self.station_id,
+
+                                "cycle_duration_seconds":
+                                    cycle_duration
+                            },
+                            current_production_id=
+                                self.current_production_id
+                        )
+
+                self.pending_outcome = "OK"
 
                 # Volta para AGUARDANDO. Um novo ciclo so' comeca
                 # quando uma NOVA luva (aberta, fora da caixa) for
@@ -1714,6 +1967,30 @@ global_status = {
     "last_production_id":
         None
 }
+
+# ============================================================
+# THREAD DE ATUALIZACAO DE ZONAS (recarrega do Supabase de
+# tempos em tempos, sem precisar reiniciar o motor)
+# ============================================================
+
+def zones_refresh_worker():
+
+    if ZONES_REFRESH_SECONDS <= 0:
+        return
+
+    while True:
+
+        time.sleep(
+            ZONES_REFRESH_SECONDS
+        )
+
+        updated_zones = load_zones_for_local_vision(
+            station["id"]
+        )
+
+        configure_zones(
+            updated_zones
+        )
 
 # ============================================================
 # WORKER PRODUCAO
@@ -1943,7 +2220,7 @@ def start_streaming():
                 detections
             )
 
-            draw_box_roi(frame)
+            draw_zones(frame)
 
             cv2.putText(
                 frame,
@@ -2199,6 +2476,11 @@ def main():
         args=(
             event_writer,
         ),
+        daemon=True
+    ).start()
+
+    threading.Thread(
+        target=zones_refresh_worker,
         daemon=True
     ).start()
 
